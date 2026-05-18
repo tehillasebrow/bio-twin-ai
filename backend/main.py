@@ -36,7 +36,18 @@ class Workout(SQLModel, table=True):
     duration_minutes: int
     calories_burned: int
     date_logged: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
+class UserToken(SQLModel, table=True):
+    user_id: int = Field(primary_key=True)
+    access_token: str
+    refresh_token: str
 
+class DailyMetric(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    user_id: int
+    date_logged: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
+    steps: int = 0
+    active_minutes: int = 0
+    sleep_minutes: int = 0
 from database import create_db_and_tables, get_session
 
 @asynccontextmanager
@@ -138,3 +149,117 @@ def get_meals(session: Session = Depends(get_session)):
 @app.get("/workouts/", response_model=List[Workout])
 def get_workouts(session: Session = Depends(get_session)):
     return session.exec(select(Workout)).all()
+from fastapi.responses import RedirectResponse
+import urllib.parse
+
+FITBIT_CLIENT_ID = os.environ.get("FITBIT_CLIENT_ID")
+FITBIT_CLIENT_SECRET = os.environ.get("FITBIT_CLIENT_SECRET")
+REDIRECT_URI = "http://localhost:8000/auth/fitbit/callback"
+
+@app.get("/auth/fitbit/login")
+def fitbit_login():
+    """Step 1: Redirect user to Fitbit's authorization page."""
+    scopes = "activity sleep profile"
+    auth_url = (
+        f"https://www.fitbit.com/oauth2/authorize?response_type=code"
+        f"&client_id={FITBIT_CLIENT_ID}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
+        f"&scope={urllib.parse.quote(scopes)}"
+    )
+    return RedirectResponse(url=auth_url)
+
+@app.get("/auth/fitbit/callback")
+def fitbit_callback(code: str, session: Session = Depends(get_session)):
+    """Step 2: Exchange authorization code for access & refresh tokens."""
+    # Fitbit requires Basic Auth with Base64 encoded Client ID:Secret
+    auth_str = f"{FITBIT_CLIENT_ID}:{FITBIT_CLIENT_SECRET}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
+    
+    headers = {
+        "Authorization": f"Basic {b64_auth}",
+        "Content-Type": "application/x-www-form-urlencoded"
+    }
+    data = {
+        "client_id": FITBIT_CLIENT_ID,
+        "grant_type": "authorization_code",
+        "redirect_uri": REDIRECT_URI,
+        "code": code
+    }
+    
+    response = requests.post("https://api.fitbit.com/oauth2/token", headers=headers, data=data)
+    token_data = response.json()
+    
+    if "access_token" not in token_data:
+        raise HTTPException(status_code=400, detail="Failed to retrieve token")
+        
+    # Hardcoded user_id=1 for demonstration. In production, get this from your auth system.
+    user_id = 1 
+    
+    # Save or update the token in the database
+    existing_token = session.get(UserToken, user_id)
+    if existing_token:
+        existing_token.access_token = token_data["access_token"]
+        existing_token.refresh_token = token_data["refresh_token"]
+        session.add(existing_token)
+    else:
+        new_token = UserToken(
+            user_id=user_id,
+            access_token=token_data["access_token"],
+            refresh_token=token_data["refresh_token"]
+        )
+        session.add(new_token)
+        
+    session.commit()
+    
+    # Redirect back to your Next.js frontend
+    return RedirectResponse(url="http://localhost:3000/dashboard?fitbit_connected=true")
+@app.post("/api/sync-fitbit/{user_id}")
+def sync_fitbit_data(user_id: int, session: Session = Depends(get_session)):
+    user_token = session.get(UserToken, user_id)
+    if not user_token:
+        raise HTTPException(status_code=404, detail="User Fitbit not connected")
+
+    headers = {"Authorization": f"Bearer {user_token.access_token}"}
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # 1. Fetch Activity (Steps & Active Minutes)
+    activity_url = f"https://api.fitbit.com/1/user/-/activities/date/{today}.json"
+    activity_res = requests.get(activity_url, headers=headers).json()
+    
+    steps = activity_res.get("summary", {}).get("steps", 0)
+    
+    # Fitbit categorizes active minutes into lightly, fairly, and very active. 
+    # Usually, "active minutes" is fairly + very active.
+    fairly_active = activity_res.get("summary", {}).get("fairlyActiveMinutes", 0)
+    very_active = activity_res.get("summary", {}).get("veryActiveMinutes", 0)
+    total_active_minutes = fairly_active + very_active
+
+    # 2. Fetch Sleep
+    sleep_url = f"https://api.fitbit.com/1.2/user/-/sleep/date/{today}.json"
+    sleep_res = requests.get(sleep_url, headers=headers).json()
+    
+    sleep_minutes = 0
+    if sleep_res.get("sleep") and len(sleep_res["sleep"]) > 0:
+        sleep_minutes = sleep_res["sleep"][0].get("minutesAsleep", 0)
+
+    # 3. Save to Database
+    # Check if a metric entry already exists for today
+    statement = select(DailyMetric).where(DailyMetric.user_id == user_id, DailyMetric.date_logged == today)
+    metric = session.exec(statement).first()
+
+    if metric:
+        metric.steps = steps
+        metric.active_minutes = total_active_minutes
+        metric.sleep_minutes = sleep_minutes
+        session.add(metric)
+    else:
+        new_metric = DailyMetric(
+            user_id=user_id,
+            steps=steps,
+            active_minutes=total_active_minutes,
+            sleep_minutes=sleep_minutes,
+            date_logged=today
+        )
+        session.add(new_metric)
+
+    session.commit()
+    return {"message": "Fitbit data synchronized successfully", "steps": steps, "active_minutes": total_active_minutes, "sleep_minutes": sleep_minutes}

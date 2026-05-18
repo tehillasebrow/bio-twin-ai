@@ -108,7 +108,7 @@ export default function Home() {
           </div>
         ))}
       </div>
-
+<a href="http://localhost:8000/auth/fitbit/login">Connect Fitbit</a>
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 mb-12">
         {/* 1. AI LENS */}
         <form onSubmit={handleAILog} className="bg-white p-8 rounded-[2rem] shadow-sm border border-slate-100">

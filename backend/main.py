@@ -1,63 +1,45 @@
 import os
 import json
 import base64
-from datetime import datetime
+import urllib.parse
+from datetime import datetime, timedelta
 from typing import Optional, List
-import requests
 
+import requests
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
-
-from sqlmodel import Session, select, Field, SQLModel
 from contextlib import asynccontextmanager
+
+from sqlmodel import Session, select
 
 from google import genai
 from google.genai import types
 
-# --- RESTORED & UPDATED MODELS ---
-class Meal(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int
-    description: str
-    calories: int
-    protein_g: float
-    carbs_g: float
-    fat_g: float
-    image_data: Optional[str] = None 
-    date_logged: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
-    items_json: Optional[str] = None # Detailed breakdown
+from database import (
+    create_db_and_tables,
+    get_session,
+    User,
+    Meal,
+    Workout,
+    UserToken,
+    DailyMetric,
+    WeightLog,
+)
 
-class Workout(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int
-    type: str
-    duration_minutes: int
-    calories_burned: int
-    date_logged: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
-class UserToken(SQLModel, table=True):
-    user_id: int = Field(primary_key=True)
-    access_token: str
-    refresh_token: str
 
-class DailyMetric(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
-    user_id: int
-    date_logged: str = Field(default_factory=lambda: datetime.now().strftime("%Y-%m-%d"))
-    steps: int = 0
-    active_minutes: int = 0
-    sleep_minutes: int = 0
-from database import create_db_and_tables, get_session
+load_dotenv()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     create_db_and_tables()
     yield
 
-app = FastAPI(lifespan=lifespan)
-load_dotenv()
-client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+
+app = FastAPI(lifespan=lifespan, title="Bio-Twin AI Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,73 +49,212 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- TRUTH ENGINE UTILITY ---
-def get_usda_data(query: str):
-    api_key = os.environ.get("USDA_API_KEY", "DEMO_KEY")
-    url = f"https://api.nal.usda.gov/fdc/v1/foods/search?api_key={api_key}&query={query}&pageSize=1"
-    try:
-        res = requests.get(url).json()
-        if res.get("foods"):
-            food = res["foods"][0]
-            macros = {"calories": 0, "protein": 0.0, "carbs": 0.0, "fat": 0.0, "name": food.get("description")}
-            for n in food.get("foodNutrients", []):
-                name = n.get("nutrientName", "").lower()
-                val = n.get("value", 0.0)
-                if "energy" in name and "kcal" in n.get("unitName", "").lower(): macros["calories"] = int(val)
-                elif "protein" in name: macros["protein"] = val
-                elif "carbohydrate" in name: macros["carbs"] = val
-                elif "total lipid (fat)" in name: macros["fat"] = val
-            return macros
-    except: pass
-    return None
+client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+GEMINI_MODEL = "gemini-2.5-flash"
 
+
+# ---------- Helpers ----------
+def parse_gemini_json(text: str) -> dict:
+    """Pull a JSON object out of a Gemini response that may be fenced or raw."""
+    cleaned = text.strip()
+    if "```" in cleaned:
+        parts = cleaned.split("```")
+        for part in parts:
+            stripped = part.strip()
+            if stripped.startswith("json"):
+                stripped = stripped[4:].strip()
+            if stripped.startswith("{") or stripped.startswith("["):
+                return json.loads(stripped)
+    return json.loads(cleaned)
+
+
+def get_usda_data(query: str) -> Optional[dict]:
+    api_key = os.environ.get("USDA_API_KEY", "DEMO_KEY")
+    url = (
+        f"https://api.nal.usda.gov/fdc/v1/foods/search"
+        f"?api_key={api_key}&query={urllib.parse.quote(query)}&pageSize=1"
+    )
+    try:
+        res = requests.get(url, timeout=10).json()
+        if not res.get("foods"):
+            return None
+        food = res["foods"][0]
+        macros = {
+            "calories": 0,
+            "protein": 0.0,
+            "carbs": 0.0,
+            "fat": 0.0,
+            "name": food.get("description"),
+        }
+        for n in food.get("foodNutrients", []):
+            name = n.get("nutrientName", "").lower()
+            val = n.get("value", 0.0)
+            unit = n.get("unitName", "").lower()
+            if "energy" in name and "kcal" in unit:
+                macros["calories"] = int(val)
+            elif "protein" in name:
+                macros["protein"] = val
+            elif "carbohydrate" in name:
+                macros["carbs"] = val
+            elif "total lipid (fat)" in name:
+                macros["fat"] = val
+        return macros
+    except Exception:
+        return None
+
+
+def update_streak(session: Session, user_id: int) -> int:
+    """Recalculate the user's logging streak based on consecutive days with at least one meal."""
+    user = session.get(User, user_id)
+    if not user:
+        user = User(id=user_id, email=f"user{user_id}@local")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    yesterday_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    todays_meals = session.exec(
+        select(Meal).where(Meal.user_id == user_id, Meal.date_logged == today_str)
+    ).all()
+    if not todays_meals:
+        return user.current_streak
+
+    if user.last_streak_date == today_str:
+        return user.current_streak
+
+    if user.last_streak_date == yesterday_str:
+        user.current_streak += 1
+    else:
+        user.current_streak = 1
+
+    user.last_streak_date = today_str
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user.current_streak
+
+
+# ---------- Schemas ----------
 class MealTextInput(BaseModel):
     user_id: int
     description: str
     image_base64: Optional[str] = None
 
+
+class WeightInput(BaseModel):
+    user_id: int
+    weight_lbs: float
+
+
+class UserSetup(BaseModel):
+    user_id: int
+    email: str
+    name: Optional[str] = None
+    current_weight_lbs: Optional[float] = None
+    height_in: Optional[float] = None
+    daily_calorie_goal: Optional[int] = None
+
+
+# ---------- AI Meal Logging (Vision + Text) ----------
 @app.post("/ai/log-meal/", response_model=Meal)
 def ai_log_meal(input_data: MealTextInput, session: Session = Depends(get_session)):
-    prompt = f"Analyze this meal: {input_data.description}. Return JSON: {{'items': [{{'name', 'quantity', 'calories'}}], 'total_macros': {{'calories', 'protein_g', 'carbs_g', 'fat_g'}}}}"
+    if not input_data.description and not input_data.image_base64:
+        raise HTTPException(status_code=400, detail="Provide a description or image")
+
+    prompt = (
+        "You are a nutrition parser. Analyze the meal "
+        f"described as: '{input_data.description or '(see image)'}'. "
+        "If an image is provided, identify foods and estimate portion sizes from it. "
+        "Return ONLY valid JSON in this exact shape: "
+        '{"items": [{"name": str, "quantity": str, "calories": int}], '
+        '"total_macros": {"calories": int, "protein_g": float, "carbs_g": float, "fat_g": float}, '
+        '"is_food": true}. '
+        "If the input is not food (a car, a person, random text), return "
+        '{"is_food": false, "reason": "..."}.'
+    )
+
     contents = [prompt]
     if input_data.image_base64:
-        contents.append(types.Part.from_bytes(data=base64.b64decode(input_data.image_base64), mime_type='image/jpeg'))
+        try:
+            contents.append(
+                types.Part.from_bytes(
+                    data=base64.b64decode(input_data.image_base64),
+                    mime_type="image/jpeg",
+                )
+            )
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid image data")
 
-    response = client.models.generate_content(model="gemini-1.5-flash", contents=contents)
-    data = json.loads(response.text.strip().split("```json")[1].split("```")[0])
+    try:
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=contents)
+        data = parse_gemini_json(response.text)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"AI parsing failed: {e}")
 
-    # Automatic Truth Engine Check
-    usda = get_usda_data(data["items"][0]["name"])
-    final_cals = usda["calories"] if usda else data["total_macros"]["calories"]
+    if data.get("is_food") is False:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Not a food item: {data.get('reason', 'unknown')}",
+        )
+
+    if not data.get("items") or not data.get("total_macros"):
+        raise HTTPException(status_code=500, detail="AI returned malformed payload")
+
+    # Truth Engine: cross-check with USDA on the dominant item
+    primary_item = data["items"][0]["name"]
+    usda = get_usda_data(primary_item)
+    ai_cals = int(data["total_macros"].get("calories", 0))
+    final_cals = ai_cals
+    usda_verified = False
+    flagged = False
+    if usda and usda["calories"] > 0:
+        usda_verified = True
+        if ai_cals == 0:
+            final_cals = usda["calories"]
+        else:
+            delta = abs(ai_cals - usda["calories"]) / max(usda["calories"], 1)
+            if delta > 0.20:
+                flagged = True
 
     new_meal = Meal(
         user_id=input_data.user_id,
-        description=input_data.description or data["items"][0]["name"],
+        description=input_data.description or primary_item,
         calories=final_cals,
-        protein_g=data["total_macros"]["protein_g"],
-        carbs_g=data["total_macros"]["carbs_g"],
-        fat_g=data["total_macros"]["fat_g"],
+        protein_g=float(data["total_macros"].get("protein_g", 0)),
+        carbs_g=float(data["total_macros"].get("carbs_g", 0)),
+        fat_g=float(data["total_macros"].get("fat_g", 0)),
         image_data=input_data.image_base64,
-        items_json=json.dumps(data["items"])
+        items_json=json.dumps(data["items"]),
+        usda_verified=usda_verified,
+        ai_estimate_flagged=flagged,
     )
     session.add(new_meal)
     session.commit()
     session.refresh(new_meal)
+
+    update_streak(session, input_data.user_id)
     return new_meal
 
-# --- RESTORED MANUAL & WORKOUT ENDPOINTS ---
+
+# ---------- Manual food + USDA search ----------
 @app.post("/api/search-food/")
 def manual_search(query_data: dict):
-    data = get_usda_data(query_data["query"])
-    if not data: raise HTTPException(status_code=404, detail="Not found")
+    data = get_usda_data(query_data.get("query", ""))
+    if not data:
+        raise HTTPException(status_code=404, detail="Not found")
     return data
+
 
 @app.post("/meals/", response_model=Meal)
 def create_meal_manual(meal: Meal, session: Session = Depends(get_session)):
     session.add(meal)
     session.commit()
     session.refresh(meal)
+    update_streak(session, meal.user_id)
     return meal
+
 
 @app.post("/workouts/", response_model=Workout)
 def create_workout(workout: Workout, session: Session = Depends(get_session)):
@@ -142,24 +263,283 @@ def create_workout(workout: Workout, session: Session = Depends(get_session)):
     session.refresh(workout)
     return workout
 
+
 @app.get("/meals/", response_model=List[Meal])
 def get_meals(session: Session = Depends(get_session)):
     return session.exec(select(Meal)).all()
 
+
 @app.get("/workouts/", response_model=List[Workout])
 def get_workouts(session: Session = Depends(get_session)):
     return session.exec(select(Workout)).all()
-from fastapi.responses import RedirectResponse
-import urllib.parse
 
+
+# ---------- User profile + weight ----------
+@app.post("/api/user/", response_model=User)
+def upsert_user(payload: UserSetup, session: Session = Depends(get_session)):
+    user = session.get(User, payload.user_id)
+    if user:
+        if payload.email:
+            user.email = payload.email
+        if payload.name is not None:
+            user.name = payload.name
+        if payload.current_weight_lbs is not None:
+            user.current_weight_lbs = payload.current_weight_lbs
+        if payload.height_in is not None:
+            user.height_in = payload.height_in
+        if payload.daily_calorie_goal is not None:
+            user.daily_calorie_goal = payload.daily_calorie_goal
+    else:
+        user = User(
+            id=payload.user_id,
+            email=payload.email,
+            name=payload.name,
+            current_weight_lbs=payload.current_weight_lbs,
+            height_in=payload.height_in,
+            daily_calorie_goal=payload.daily_calorie_goal or 2500,
+        )
+    session.add(user)
+    session.commit()
+    session.refresh(user)
+    return user
+
+
+@app.get("/api/user/{user_id}", response_model=User)
+def get_user(user_id: int, session: Session = Depends(get_session)):
+    user = session.get(User, user_id)
+    if not user:
+        user = User(id=user_id, email=f"user{user_id}@local")
+        session.add(user)
+        session.commit()
+        session.refresh(user)
+    return user
+
+
+@app.post("/api/weight/", response_model=WeightLog)
+def log_weight(payload: WeightInput, session: Session = Depends(get_session)):
+    entry = WeightLog(user_id=payload.user_id, weight_lbs=payload.weight_lbs)
+    session.add(entry)
+
+    user = session.get(User, payload.user_id)
+    if user:
+        user.current_weight_lbs = payload.weight_lbs
+        session.add(user)
+
+    session.commit()
+    session.refresh(entry)
+    return entry
+
+
+@app.get("/api/weight/{user_id}", response_model=List[WeightLog])
+def get_weight_history(user_id: int, session: Session = Depends(get_session)):
+    return session.exec(
+        select(WeightLog).where(WeightLog.user_id == user_id).order_by(WeightLog.date_logged)
+    ).all()
+
+
+# ---------- Daily metrics (used by chart + coach) ----------
+@app.get("/api/metrics/{user_id}", response_model=List[DailyMetric])
+def get_metrics(user_id: int, session: Session = Depends(get_session)):
+    return session.exec(
+        select(DailyMetric).where(DailyMetric.user_id == user_id).order_by(DailyMetric.date_logged)
+    ).all()
+
+
+# ---------- Report 6: AI Coach ----------
+@app.get("/api/coach/{user_id}")
+def get_coach_insight(user_id: int, session: Session = Depends(get_session)):
+    """Pulls last 7 days of meals, workouts, and metrics; asks Gemini to coach."""
+    cutoff = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    meals = session.exec(
+        select(Meal).where(Meal.user_id == user_id, Meal.date_logged >= cutoff)
+    ).all()
+    workouts = session.exec(
+        select(Workout).where(Workout.user_id == user_id, Workout.date_logged >= cutoff)
+    ).all()
+    metrics = session.exec(
+        select(DailyMetric).where(
+            DailyMetric.user_id == user_id, DailyMetric.date_logged >= cutoff
+        )
+    ).all()
+
+    if not meals and not workouts and not metrics:
+        return {
+            "insight": "Log a few days of meals and workouts so the coach has something to work with."
+        }
+
+    summary = {
+        "days_with_data": len(set(m.date_logged for m in meals)),
+        "meals": [
+            {
+                "date": m.date_logged,
+                "description": m.description,
+                "calories": m.calories,
+                "protein_g": m.protein_g,
+                "carbs_g": m.carbs_g,
+                "fat_g": m.fat_g,
+            }
+            for m in meals
+        ],
+        "workouts": [
+            {
+                "date": w.date_logged,
+                "type": w.type,
+                "duration_minutes": w.duration_minutes,
+                "calories_burned": w.calories_burned,
+            }
+            for w in workouts
+        ],
+        "daily_metrics": [
+            {
+                "date": d.date_logged,
+                "steps": d.steps,
+                "active_minutes": d.active_minutes,
+                "sleep_minutes": d.sleep_minutes,
+            }
+            for d in metrics
+        ],
+    }
+
+    prompt = (
+        "You are a harsh but fair fitness coach. The user's last 7 days of data follows. "
+        "Analyze sleep, protein, calories, activity, and recovery. "
+        "Return ONLY valid JSON: "
+        '{"insight": "2-3 sentence analysis", "action": "one concrete instruction for tomorrow"}. '
+        "Be specific and reference actual numbers from the data.\n\n"
+        f"DATA: {json.dumps(summary)}"
+    )
+
+    try:
+        response = client.models.generate_content(model=GEMINI_MODEL, contents=[prompt])
+        return parse_gemini_json(response.text)
+    except Exception as e:
+        return {"insight": "Coach is offline.", "action": str(e)}
+
+
+# ---------- Reports 7 & 8: streak + weight prediction ----------
+@app.get("/api/streak/{user_id}")
+def get_streak(user_id: int, session: Session = Depends(get_session)):
+    user = session.get(User, user_id)
+    if not user:
+        return {"streak": 0, "goal": 2500}
+    return {
+        "streak": user.current_streak,
+        "last_streak_date": user.last_streak_date,
+        "goal": user.daily_calorie_goal,
+    }
+
+
+@app.get("/api/prediction/{user_id}")
+def predict_weight(user_id: int, days_ahead: int = 30, session: Session = Depends(get_session)):
+    """Linear-regression projection of weight `days_ahead` days from now,
+    based on average daily calorie deficit/surplus across the last 14 days.
+    Falls back to weight-log regression if calorie data is missing.
+    """
+    user = session.get(User, user_id)
+    if not user or user.current_weight_lbs is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Set current_weight_lbs on the user profile before predicting.",
+        )
+
+    end = datetime.now().date()
+    start = end - timedelta(days=14)
+    start_str = start.strftime("%Y-%m-%d")
+
+    meals = session.exec(
+        select(Meal).where(Meal.user_id == user_id, Meal.date_logged >= start_str)
+    ).all()
+    workouts = session.exec(
+        select(Workout).where(Workout.user_id == user_id, Workout.date_logged >= start_str)
+    ).all()
+    metrics = session.exec(
+        select(DailyMetric).where(
+            DailyMetric.user_id == user_id, DailyMetric.date_logged >= start_str
+        )
+    ).all()
+
+    # Aggregate per-day net calories
+    days = {}
+    for i in range(14):
+        d = (start + timedelta(days=i + 1)).strftime("%Y-%m-%d")
+        days[d] = {"intake": 0, "burn": 0}
+    for m in meals:
+        if m.date_logged in days:
+            days[m.date_logged]["intake"] += m.calories
+    for w in workouts:
+        if w.date_logged in days:
+            days[w.date_logged]["burn"] += w.calories_burned
+    for dm in metrics:
+        if dm.date_logged in days:
+            days[dm.date_logged]["burn"] += dm.active_minutes * 7  # rough kcal/min
+
+    # BMR baseline (Mifflin-St Jeor, assuming 30y/o male if no height — rough)
+    bmr = 10 * (user.current_weight_lbs / 2.205) + 6.25 * (user.height_in or 70) * 2.54 - 5 * 30 + 5
+
+    daily_deltas = []
+    for day, vals in days.items():
+        if vals["intake"] == 0:
+            continue
+        # net = intake - (bmr + activity burn)
+        daily_deltas.append(vals["intake"] - (bmr + vals["burn"]))
+
+    if not daily_deltas:
+        # Fallback: regress over weight logs
+        history = session.exec(
+            select(WeightLog).where(WeightLog.user_id == user_id).order_by(WeightLog.date_logged)
+        ).all()
+        if len(history) < 2:
+            return {
+                "current_weight_lbs": user.current_weight_lbs,
+                "predicted_weight_lbs": user.current_weight_lbs,
+                "days_ahead": days_ahead,
+                "trend": "insufficient data",
+                "slope_lbs_per_day": 0.0,
+            }
+        # simple slope between first and last weight log
+        first, last = history[0], history[-1]
+        d0 = datetime.strptime(first.date_logged, "%Y-%m-%d")
+        d1 = datetime.strptime(last.date_logged, "%Y-%m-%d")
+        days_span = max((d1 - d0).days, 1)
+        slope = (last.weight_lbs - first.weight_lbs) / days_span
+        predicted = user.current_weight_lbs + slope * days_ahead
+        return {
+            "current_weight_lbs": user.current_weight_lbs,
+            "predicted_weight_lbs": round(predicted, 2),
+            "days_ahead": days_ahead,
+            "trend": "rising" if slope > 0.02 else ("falling" if slope < -0.02 else "stable"),
+            "slope_lbs_per_day": round(slope, 4),
+            "source": "weight_log_regression",
+        }
+
+    avg_daily_delta_kcal = sum(daily_deltas) / len(daily_deltas)
+    # 3500 kcal ≈ 1 lb body fat
+    lbs_per_day = avg_daily_delta_kcal / 3500.0
+    predicted = user.current_weight_lbs + lbs_per_day * days_ahead
+
+    return {
+        "current_weight_lbs": user.current_weight_lbs,
+        "predicted_weight_lbs": round(predicted, 2),
+        "days_ahead": days_ahead,
+        "avg_daily_delta_kcal": round(avg_daily_delta_kcal, 1),
+        "slope_lbs_per_day": round(lbs_per_day, 4),
+        "trend": "gaining"
+        if lbs_per_day > 0.02
+        else ("losing" if lbs_per_day < -0.02 else "maintaining"),
+        "source": "calorie_balance",
+    }
+
+
+# ---------- Fitbit OAuth ----------
 FITBIT_CLIENT_ID = os.environ.get("FITBIT_CLIENT_ID")
 FITBIT_CLIENT_SECRET = os.environ.get("FITBIT_CLIENT_SECRET")
 REDIRECT_URI = "http://localhost:8000/auth/fitbit/callback"
 
+
 @app.get("/auth/fitbit/login")
 def fitbit_login():
-    """Step 1: Redirect user to Fitbit's authorization page."""
-    scopes = "activity sleep profile"
+    scopes = "activity sleep profile heartrate"
     auth_url = (
         f"https://www.fitbit.com/oauth2/authorize?response_type=code"
         f"&client_id={FITBIT_CLIENT_ID}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
@@ -167,99 +547,124 @@ def fitbit_login():
     )
     return RedirectResponse(url=auth_url)
 
+
 @app.get("/auth/fitbit/callback")
 def fitbit_callback(code: str, session: Session = Depends(get_session)):
-    """Step 2: Exchange authorization code for access & refresh tokens."""
-    # Fitbit requires Basic Auth with Base64 encoded Client ID:Secret
     auth_str = f"{FITBIT_CLIENT_ID}:{FITBIT_CLIENT_SECRET}"
     b64_auth = base64.b64encode(auth_str.encode()).decode()
-    
     headers = {
         "Authorization": f"Basic {b64_auth}",
-        "Content-Type": "application/x-www-form-urlencoded"
+        "Content-Type": "application/x-www-form-urlencoded",
     }
     data = {
         "client_id": FITBIT_CLIENT_ID,
         "grant_type": "authorization_code",
         "redirect_uri": REDIRECT_URI,
-        "code": code
+        "code": code,
     }
-    
     response = requests.post("https://api.fitbit.com/oauth2/token", headers=headers, data=data)
     token_data = response.json()
-    
     if "access_token" not in token_data:
         raise HTTPException(status_code=400, detail="Failed to retrieve token")
-        
-    # Hardcoded user_id=1 for demonstration. In production, get this from your auth system.
-    user_id = 1 
-    
-    # Save or update the token in the database
-    existing_token = session.get(UserToken, user_id)
-    if existing_token:
-        existing_token.access_token = token_data["access_token"]
-        existing_token.refresh_token = token_data["refresh_token"]
-        session.add(existing_token)
+
+    user_id = 1
+    existing = session.get(UserToken, user_id)
+    if existing:
+        existing.access_token = token_data["access_token"]
+        existing.refresh_token = token_data["refresh_token"]
+        session.add(existing)
     else:
-        new_token = UserToken(
-            user_id=user_id,
-            access_token=token_data["access_token"],
-            refresh_token=token_data["refresh_token"]
+        session.add(
+            UserToken(
+                user_id=user_id,
+                access_token=token_data["access_token"],
+                refresh_token=token_data["refresh_token"],
+            )
         )
-        session.add(new_token)
-        
     session.commit()
-    
-    # Redirect back to your Next.js frontend
-    return RedirectResponse(url="http://localhost:3000/dashboard?fitbit_connected=true")
+    return RedirectResponse(url="http://localhost:3000/?fitbit_connected=true")
+
+
+def _refresh_fitbit_token(session: Session, user_token: UserToken) -> UserToken:
+    auth_str = f"{FITBIT_CLIENT_ID}:{FITBIT_CLIENT_SECRET}"
+    b64_auth = base64.b64encode(auth_str.encode()).decode()
+    res = requests.post(
+        "https://api.fitbit.com/oauth2/token",
+        headers={
+            "Authorization": f"Basic {b64_auth}",
+            "Content-Type": "application/x-www-form-urlencoded",
+        },
+        data={"grant_type": "refresh_token", "refresh_token": user_token.refresh_token},
+    ).json()
+    if "access_token" in res:
+        user_token.access_token = res["access_token"]
+        user_token.refresh_token = res.get("refresh_token", user_token.refresh_token)
+        session.add(user_token)
+        session.commit()
+        session.refresh(user_token)
+    return user_token
+
+
 @app.post("/api/sync-fitbit/{user_id}")
 def sync_fitbit_data(user_id: int, session: Session = Depends(get_session)):
     user_token = session.get(UserToken, user_id)
     if not user_token:
         raise HTTPException(status_code=404, detail="User Fitbit not connected")
 
-    headers = {"Authorization": f"Bearer {user_token.access_token}"}
     today = datetime.now().strftime("%Y-%m-%d")
 
-    # 1. Fetch Activity (Steps & Active Minutes)
-    activity_url = f"https://api.fitbit.com/1/user/-/activities/date/{today}.json"
-    activity_res = requests.get(activity_url, headers=headers).json()
-    
-    steps = activity_res.get("summary", {}).get("steps", 0)
-    
-    # Fitbit categorizes active minutes into lightly, fairly, and very active. 
-    # Usually, "active minutes" is fairly + very active.
-    fairly_active = activity_res.get("summary", {}).get("fairlyActiveMinutes", 0)
-    very_active = activity_res.get("summary", {}).get("veryActiveMinutes", 0)
-    total_active_minutes = fairly_active + very_active
+    def fetch(url, retried=False):
+        headers = {"Authorization": f"Bearer {user_token.access_token}"}
+        res = requests.get(url, headers=headers)
+        if res.status_code == 401 and not retried:
+            _refresh_fitbit_token(session, user_token)
+            return fetch(url, retried=True)
+        return res.json()
 
-    # 2. Fetch Sleep
-    sleep_url = f"https://api.fitbit.com/1.2/user/-/sleep/date/{today}.json"
-    sleep_res = requests.get(sleep_url, headers=headers).json()
-    
+    activity_res = fetch(f"https://api.fitbit.com/1/user/-/activities/date/{today}.json")
+    summary = activity_res.get("summary", {})
+    steps = summary.get("steps", 0)
+    total_active_minutes = summary.get("fairlyActiveMinutes", 0) + summary.get(
+        "veryActiveMinutes", 0
+    )
+    resting_hr = summary.get("restingHeartRate")
+
+    sleep_res = fetch(f"https://api.fitbit.com/1.2/user/-/sleep/date/{today}.json")
     sleep_minutes = 0
-    if sleep_res.get("sleep") and len(sleep_res["sleep"]) > 0:
+    if sleep_res.get("sleep"):
         sleep_minutes = sleep_res["sleep"][0].get("minutesAsleep", 0)
 
-    # 3. Save to Database
-    # Check if a metric entry already exists for today
-    statement = select(DailyMetric).where(DailyMetric.user_id == user_id, DailyMetric.date_logged == today)
+    statement = select(DailyMetric).where(
+        DailyMetric.user_id == user_id, DailyMetric.date_logged == today
+    )
     metric = session.exec(statement).first()
-
     if metric:
         metric.steps = steps
         metric.active_minutes = total_active_minutes
         metric.sleep_minutes = sleep_minutes
+        metric.resting_heart_rate = resting_hr
         session.add(metric)
     else:
-        new_metric = DailyMetric(
-            user_id=user_id,
-            steps=steps,
-            active_minutes=total_active_minutes,
-            sleep_minutes=sleep_minutes,
-            date_logged=today
+        session.add(
+            DailyMetric(
+                user_id=user_id,
+                steps=steps,
+                active_minutes=total_active_minutes,
+                sleep_minutes=sleep_minutes,
+                resting_heart_rate=resting_hr,
+                date_logged=today,
+            )
         )
-        session.add(new_metric)
-
     session.commit()
-    return {"message": "Fitbit data synchronized successfully", "steps": steps, "active_minutes": total_active_minutes, "sleep_minutes": sleep_minutes}
+    return {
+        "message": "Fitbit data synchronized",
+        "steps": steps,
+        "active_minutes": total_active_minutes,
+        "sleep_minutes": sleep_minutes,
+        "resting_heart_rate": resting_hr,
+    }
+
+
+@app.get("/")
+def root():
+    return {"status": "Bio-Twin AI backend running"}

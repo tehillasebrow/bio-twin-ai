@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \"import sqlite3; c = sqlite3.connect\\('biotwin.db'\\); cur = c.cursor\\(\\); print\\('TABLES:'\\); [print\\(' -', r[0]\\) for r in cur.execute\\(\\\\\"SELECT name FROM sqlite_master WHERE type='table'\\\\\"\\)]; print\\('MEALS:', cur.execute\\('SELECT COUNT\\(*\\) FROM meal'\\).fetchone\\(\\)[0] if cur.execute\\(\\\\\"SELECT name FROM sqlite_master WHERE type='table' AND name='meal'\\\\\"\\).fetchone\\(\\) else 'none'\\); print\\('WORKOUTS:', cur.execute\\('SELECT COUNT\\(*\\) FROM workout'\\).fetchone\\(\\)[0] if cur.execute\\(\\\\\"SELECT name FROM sqlite_master WHERE type='table' AND name='workout'\\\\\"\\).fetchone\\(\\) else 'none'\\)\")",
+      "Bash(venv/Scripts/python.exe -c \"import main; print\\('OK - main.py imports cleanly'\\)\")",
+      "Bash(venv/Scripts/uvicorn.exe main:app --host 127.0.0.1 --port 8765)",
+      "Bash(curl -s http://127.0.0.1:8765/)",
+      "Bash(curl -s http://127.0.0.1:8765/api/streak/1)",
+      "Bash(curl -s http://127.0.0.1:8765/api/user/1)",
+      "Bash(curl -s http://127.0.0.1:8765/meals/)",
+      "Bash(python -c ' *)",
+      "Bash(curl -s -X DELETE)",
+      "PowerShell($p = \\(Get-NetTCPConnection -LocalPort 8765 -ErrorAction SilentlyContinue\\).OwningProcess; if \\($p\\) { Stop-Process -Id $p -Force; \"killed $p\" } else { \"no proc\" })",
+      "Bash(npm install *)"
+    ]
+  }
+}

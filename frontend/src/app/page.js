@@ -7,6 +7,8 @@ import PredictionCard from "../components/PredictionCard";
 import TwinChart from "../components/TwinChart";
 import FitbitCard from "../components/FitbitCard";
 import ProfileSetup from "../components/ProfileSetup";
+import ChatBox from "../components/ChatBox";
+import ManualMetricsCard from "../components/ManualMetricsCard";
 
 const API = "http://127.0.0.1:8000";
 const USER_ID = 1; // single-user demo
@@ -367,6 +369,25 @@ export default function Home() {
           metrics={metrics}
           userId={USER_ID}
           onSync={refreshData}
+        />
+      </section>
+
+      {/* Chat + Manual Metrics */}
+      <section className="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-6">
+        <div className="lg:col-span-2">
+          <ChatBox userId={USER_ID} onLogged={refreshData} />
+        </div>
+        <ManualMetricsCard
+          userId={USER_ID}
+          todayMetric={
+            metrics && metrics.length
+              ? metrics.filter(
+                  (m) =>
+                    m.date_logged === new Date().toISOString().split("T")[0]
+                )[0]
+              : null
+          }
+          onSaved={refreshData}
         />
       </section>
 

@@ -345,6 +345,174 @@ def get_metrics(user_id: int, session: Session = Depends(get_session)):
     ).all()
 
 
+class MetricInput(BaseModel):
+    user_id: int
+    steps: Optional[int] = None
+    active_minutes: Optional[int] = None
+    sleep_minutes: Optional[int] = None
+    resting_heart_rate: Optional[int] = None
+    date_logged: Optional[str] = None
+
+
+@app.post("/api/metrics/", response_model=DailyMetric)
+def upsert_metric(payload: MetricInput, session: Session = Depends(get_session)):
+    """Upsert today's (or a specific day's) DailyMetric. Only sets fields you pass."""
+    date = payload.date_logged or datetime.now().strftime("%Y-%m-%d")
+    existing = session.exec(
+        select(DailyMetric).where(
+            DailyMetric.user_id == payload.user_id, DailyMetric.date_logged == date
+        )
+    ).first()
+    if existing:
+        if payload.steps is not None:
+            existing.steps = payload.steps
+        if payload.active_minutes is not None:
+            existing.active_minutes = payload.active_minutes
+        if payload.sleep_minutes is not None:
+            existing.sleep_minutes = payload.sleep_minutes
+        if payload.resting_heart_rate is not None:
+            existing.resting_heart_rate = payload.resting_heart_rate
+        session.add(existing)
+        session.commit()
+        session.refresh(existing)
+        return existing
+    new = DailyMetric(
+        user_id=payload.user_id,
+        date_logged=date,
+        steps=payload.steps or 0,
+        active_minutes=payload.active_minutes or 0,
+        sleep_minutes=payload.sleep_minutes or 0,
+        resting_heart_rate=payload.resting_heart_rate,
+    )
+    session.add(new)
+    session.commit()
+    session.refresh(new)
+    return new
+
+
+# ---------- AI Chat (general chat + intent-based logging) ----------
+class ChatMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class ChatInput(BaseModel):
+    user_id: int
+    message: str
+    history: Optional[List[ChatMessage]] = None
+
+
+@app.post("/api/chat/")
+def ai_chat(payload: ChatInput, session: Session = Depends(get_session)):
+    """Smart chat: detects whether the user is logging something or just chatting,
+    writes to DB if appropriate, and returns a conversational reply."""
+    history_text = ""
+    if payload.history:
+        for m in payload.history[-6:]:  # last 6 turns
+            history_text += f"\n{m.role.upper()}: {m.content}"
+
+    classifier_prompt = (
+        "You are the brain of a fitness app. Read the user's message and decide if "
+        "they are LOGGING data or just CHATTING. "
+        "Return ONLY valid JSON in this exact shape:\n"
+        '{\n'
+        '  "intent": "chat" | "log_metric" | "log_weight" | "log_workout",\n'
+        '  "data": {\n'
+        '     "steps": int|null, "sleep_minutes": int|null, "active_minutes": int|null,\n'
+        '     "resting_heart_rate": int|null,\n'
+        '     "weight_lbs": float|null,\n'
+        '     "workout_type": string|null, "duration_minutes": int|null\n'
+        '  },\n'
+        '  "reply": "warm conversational response, 1-3 sentences"\n'
+        '}\n'
+        "Rules:\n"
+        "- If they mention sleep in hours, convert to minutes (e.g. '7 hours' = 420).\n"
+        "- If they mention steps, active minutes, sleep, or heart rate → intent=log_metric.\n"
+        "- If they mention their weight → intent=log_weight.\n"
+        "- If they mention a workout they did → intent=log_workout.\n"
+        "- Otherwise → intent=chat and leave data fields null.\n"
+        "- ALWAYS write a friendly, supportive reply.\n"
+        "- For meals, tell them to use the AI Lens form (don't log via chat).\n\n"
+        f"CONVERSATION SO FAR:{history_text}\n"
+        f"USER MESSAGE: {payload.message}"
+    )
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL, contents=[classifier_prompt]
+        )
+        parsed = parse_gemini_json(response.text)
+    except Exception as e:
+        return {"reply": "Sorry — my brain hiccuped. Try again?", "intent": "chat", "logged": None, "error": str(e)}
+
+    intent = parsed.get("intent", "chat")
+    data = parsed.get("data", {}) or {}
+    reply = parsed.get("reply", "Got it.")
+    logged = None
+
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    if intent == "log_metric":
+        existing = session.exec(
+            select(DailyMetric).where(
+                DailyMetric.user_id == payload.user_id, DailyMetric.date_logged == today
+            )
+        ).first()
+        if existing:
+            if data.get("steps") is not None:
+                existing.steps = int(data["steps"])
+            if data.get("active_minutes") is not None:
+                existing.active_minutes = int(data["active_minutes"])
+            if data.get("sleep_minutes") is not None:
+                existing.sleep_minutes = int(data["sleep_minutes"])
+            if data.get("resting_heart_rate") is not None:
+                existing.resting_heart_rate = int(data["resting_heart_rate"])
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
+            logged = {"type": "metric", "record": existing.model_dump()}
+        else:
+            new = DailyMetric(
+                user_id=payload.user_id,
+                date_logged=today,
+                steps=int(data.get("steps") or 0),
+                active_minutes=int(data.get("active_minutes") or 0),
+                sleep_minutes=int(data.get("sleep_minutes") or 0),
+                resting_heart_rate=int(data["resting_heart_rate"])
+                if data.get("resting_heart_rate") is not None
+                else None,
+            )
+            session.add(new)
+            session.commit()
+            session.refresh(new)
+            logged = {"type": "metric", "record": new.model_dump()}
+
+    elif intent == "log_weight" and data.get("weight_lbs") is not None:
+        w = WeightLog(user_id=payload.user_id, weight_lbs=float(data["weight_lbs"]))
+        session.add(w)
+        user = session.get(User, payload.user_id)
+        if user:
+            user.current_weight_lbs = float(data["weight_lbs"])
+            session.add(user)
+        session.commit()
+        session.refresh(w)
+        logged = {"type": "weight", "record": w.model_dump()}
+
+    elif intent == "log_workout" and data.get("workout_type") and data.get("duration_minutes"):
+        wk = Workout(
+            user_id=payload.user_id,
+            type=str(data["workout_type"]),
+            duration_minutes=int(data["duration_minutes"]),
+            calories_burned=int(data["duration_minutes"]) * 10,
+        )
+        session.add(wk)
+        session.commit()
+        session.refresh(wk)
+        logged = {"type": "workout", "record": wk.model_dump()}
+
+    return {"reply": reply, "intent": intent, "logged": logged}
+
+
 # ---------- Report 6: AI Coach ----------
 @app.get("/api/coach/{user_id}")
 def get_coach_insight(user_id: int, session: Session = Depends(get_session)):

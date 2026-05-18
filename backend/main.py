@@ -402,11 +402,15 @@ def get_coach_insight(user_id: int, session: Session = Depends(get_session)):
     }
 
     prompt = (
-        "You are a harsh but fair fitness coach. The user's last 7 days of data follows. "
-        "Analyze sleep, protein, calories, activity, and recovery. "
+        "You are a warm, supportive fitness coach — encouraging, never mean. "
+        "The user's last 7 days of data follows. Notice what's going well first, "
+        "then gently point out one thing to focus on. Analyze sleep, protein, "
+        "calories, activity, and recovery. "
         "Return ONLY valid JSON: "
-        '{"insight": "2-3 sentence analysis", "action": "one concrete instruction for tomorrow"}. '
-        "Be specific and reference actual numbers from the data.\n\n"
+        '{"insight": "2-3 sentence positive but honest analysis", '
+        '"action": "one small, encouraging instruction for tomorrow"}. '
+        "Be specific and reference actual numbers from the data. "
+        "Use friendly language — never shame the user.\n\n"
         f"DATA: {json.dumps(summary)}"
     )
 
@@ -484,8 +488,15 @@ def predict_weight(user_id: int, days_ahead: int = 30, session: Session = Depend
         # net = intake - (bmr + activity burn)
         daily_deltas.append(vals["intake"] - (bmr + vals["burn"]))
 
-    if not daily_deltas:
-        # Fallback: regress over weight logs
+    # Medically-sane cap: max ~2 lb/week sustained = 0.286 lb/day
+    MAX_LBS_PER_DAY = 0.286
+    MIN_DAYS_REQUIRED = 4
+
+    def clamp_slope(s: float) -> float:
+        return max(-MAX_LBS_PER_DAY, min(MAX_LBS_PER_DAY, s))
+
+    if len(daily_deltas) < MIN_DAYS_REQUIRED:
+        # Not enough calorie history — try weight-log regression instead
         history = session.exec(
             select(WeightLog).where(WeightLog.user_id == user_id).order_by(WeightLog.date_logged)
         ).all()
@@ -496,13 +507,15 @@ def predict_weight(user_id: int, days_ahead: int = 30, session: Session = Depend
                 "days_ahead": days_ahead,
                 "trend": "insufficient data",
                 "slope_lbs_per_day": 0.0,
+                "source": "insufficient_data",
+                "days_logged": len(daily_deltas),
+                "note": f"Log at least {MIN_DAYS_REQUIRED} days of meals for a real projection.",
             }
-        # simple slope between first and last weight log
         first, last = history[0], history[-1]
         d0 = datetime.strptime(first.date_logged, "%Y-%m-%d")
         d1 = datetime.strptime(last.date_logged, "%Y-%m-%d")
         days_span = max((d1 - d0).days, 1)
-        slope = (last.weight_lbs - first.weight_lbs) / days_span
+        slope = clamp_slope((last.weight_lbs - first.weight_lbs) / days_span)
         predicted = user.current_weight_lbs + slope * days_ahead
         return {
             "current_weight_lbs": user.current_weight_lbs,
@@ -514,8 +527,9 @@ def predict_weight(user_id: int, days_ahead: int = 30, session: Session = Depend
         }
 
     avg_daily_delta_kcal = sum(daily_deltas) / len(daily_deltas)
-    # 3500 kcal ≈ 1 lb body fat
-    lbs_per_day = avg_daily_delta_kcal / 3500.0
+    # 3500 kcal ≈ 1 lb body fat, then clamp to medically-sane rate
+    raw_lbs_per_day = avg_daily_delta_kcal / 3500.0
+    lbs_per_day = clamp_slope(raw_lbs_per_day)
     predicted = user.current_weight_lbs + lbs_per_day * days_ahead
 
     return {
@@ -524,6 +538,9 @@ def predict_weight(user_id: int, days_ahead: int = 30, session: Session = Depend
         "days_ahead": days_ahead,
         "avg_daily_delta_kcal": round(avg_daily_delta_kcal, 1),
         "slope_lbs_per_day": round(lbs_per_day, 4),
+        "raw_slope_lbs_per_day": round(raw_lbs_per_day, 4),
+        "days_logged": len(daily_deltas),
+        "capped": abs(raw_lbs_per_day) > MAX_LBS_PER_DAY,
         "trend": "gaining"
         if lbs_per_day > 0.02
         else ("losing" if lbs_per_day < -0.02 else "maintaining"),

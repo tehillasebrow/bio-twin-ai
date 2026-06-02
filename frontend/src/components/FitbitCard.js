@@ -1,5 +1,6 @@
 "use client";
 import { useState } from "react";
+import { API_URL } from "../lib/api";
 
 export default function FitbitCard({ metrics, userId, onSync }) {
   const [syncing, setSyncing] = useState(false);
@@ -9,7 +10,7 @@ export default function FitbitCard({ metrics, userId, onSync }) {
   const sync = async () => {
     setSyncing(true);
     try {
-      await fetch(`http://127.0.0.1:8000/api/sync-fitbit/${userId}`, {
+      await fetch(`${API_URL}/api/sync-fitbit/${userId}`, {
         method: "POST",
       });
       onSync && (await onSync());
@@ -30,7 +31,7 @@ export default function FitbitCard({ metrics, userId, onSync }) {
             {syncing ? "Syncing..." : "Sync today"}
           </button>
           <a
-            href="http://localhost:8000/auth/fitbit/login"
+            href={`${API_URL}/auth/fitbit/login`}
             className="text-xs px-3 py-1 rounded-full bg-teal-500 text-white font-semibold"
           >
             Connect

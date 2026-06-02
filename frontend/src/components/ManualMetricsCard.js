@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect } from "react";
+import { API_URL } from "../lib/api";
 
 export default function ManualMetricsCard({ userId, todayMetric, onSaved }) {
   const [steps, setSteps] = useState("");
@@ -33,7 +34,7 @@ export default function ManualMetricsCard({ userId, todayMetric, onSaved }) {
       resting_heart_rate: restingHr === "" ? null : +restingHr,
     };
     try {
-      await fetch("http://127.0.0.1:8000/api/metrics/", {
+      await fetch(`${API_URL}/api/metrics/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),

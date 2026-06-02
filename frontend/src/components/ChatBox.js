@@ -1,5 +1,6 @@
 "use client";
 import { useState, useRef, useEffect } from "react";
+import { API_URL } from "../lib/api";
 
 const SUGGESTIONS = [
   "I slept 7 hours",
@@ -38,7 +39,7 @@ export default function ChatBox({ userId, onLogged }) {
     setSending(true);
 
     try {
-      const r = await fetch("http://127.0.0.1:8000/api/chat/", {
+      const r = await fetch(`${API_URL}/api/chat/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

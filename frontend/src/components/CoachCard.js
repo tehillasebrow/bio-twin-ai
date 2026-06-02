@@ -1,5 +1,6 @@
 "use client";
 import { useEffect, useState } from "react";
+import { API_URL } from "../lib/api";
 
 export default function CoachCard({ userId, refreshKey }) {
   const [data, setData] = useState(null);
@@ -8,7 +9,7 @@ export default function CoachCard({ userId, refreshKey }) {
   const load = async () => {
     setLoading(true);
     try {
-      const r = await fetch(`http://127.0.0.1:8000/api/coach/${userId}`);
+      const r = await fetch(`${API_URL}/api/coach/${userId}`);
       if (r.ok) setData(await r.json());
     } catch (_) {
       setData({ insight: "Coach unreachable." });

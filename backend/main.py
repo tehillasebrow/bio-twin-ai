@@ -41,9 +41,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan, title="Bio-Twin AI Backend")
 
+# Comma-separated list of allowed frontend origins.
+# e.g. ALLOWED_ORIGINS="https://bio-twin-ai.vercel.app"
+ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+    if o.strip()
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -719,7 +727,11 @@ def predict_weight(user_id: int, days_ahead: int = 30, session: Session = Depend
 # ---------- Fitbit OAuth ----------
 FITBIT_CLIENT_ID = os.environ.get("FITBIT_CLIENT_ID")
 FITBIT_CLIENT_SECRET = os.environ.get("FITBIT_CLIENT_SECRET")
-REDIRECT_URI = "http://localhost:8000/auth/fitbit/callback"
+# Public URL of THIS backend (used to build the Fitbit OAuth callback).
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
+# Public URL of the frontend (where we send the user after OAuth).
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+REDIRECT_URI = f"{BACKEND_URL}/auth/fitbit/callback"
 
 
 @app.get("/auth/fitbit/login")
@@ -767,7 +779,7 @@ def fitbit_callback(code: str, session: Session = Depends(get_session)):
             )
         )
     session.commit()
-    return RedirectResponse(url="http://localhost:3000/?fitbit_connected=true")
+    return RedirectResponse(url=f"{FRONTEND_URL}/?fitbit_connected=true")
 
 
 def _refresh_fitbit_token(session: Session, user_token: UserToken) -> UserToken:

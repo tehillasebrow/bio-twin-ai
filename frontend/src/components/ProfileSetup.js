@@ -1,5 +1,6 @@
 "use client";
 import { useState, useEffect } from "react";
+import { API_URL } from "../lib/api";
 
 export default function ProfileSetup({ userId, email, onSaved }) {
   const [weight, setWeight] = useState("");
@@ -10,7 +11,7 @@ export default function ProfileSetup({ userId, email, onSaved }) {
 
   useEffect(() => {
     (async () => {
-      const r = await fetch(`http://127.0.0.1:8000/api/user/${userId}`);
+      const r = await fetch(`${API_URL}/api/user/${userId}`);
       if (r.ok) {
         const u = await r.json();
         setLoaded(u);
@@ -23,7 +24,7 @@ export default function ProfileSetup({ userId, email, onSaved }) {
 
   const save = async (e) => {
     e.preventDefault();
-    await fetch("http://127.0.0.1:8000/api/user/", {
+    await fetch(`${API_URL}/api/user/`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -35,7 +36,7 @@ export default function ProfileSetup({ userId, email, onSaved }) {
       }),
     });
     if (weight) {
-      await fetch("http://127.0.0.1:8000/api/weight/", {
+      await fetch(`${API_URL}/api/weight/`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ user_id: userId, weight_lbs: +weight }),

@@ -1,3 +1,5 @@
+import os
+
 from sqlmodel import SQLModel, Field, create_engine, Session
 from typing import Optional
 from datetime import datetime
@@ -65,9 +67,15 @@ class WeightLog(SQLModel, table=True):
     date_logged: str = Field(default_factory=_today)
 
 
-sqlite_file_name = "biotwin.db"
-sqlite_url = f"sqlite:///{sqlite_file_name}"
-engine = create_engine(sqlite_url, echo=False)
+# Use DATABASE_URL if provided (e.g. Postgres on Supabase/Neon in prod),
+# otherwise fall back to a local SQLite file for development.
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///biotwin.db")
+
+# SQLite needs check_same_thread=False to work with FastAPI's threadpool.
+connect_args = (
+    {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+)
+engine = create_engine(DATABASE_URL, echo=False, connect_args=connect_args)
 
 
 def create_db_and_tables():

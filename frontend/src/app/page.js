@@ -9,8 +9,9 @@ import FitbitCard from "../components/FitbitCard";
 import ProfileSetup from "../components/ProfileSetup";
 import ChatBox from "../components/ChatBox";
 import ManualMetricsCard from "../components/ManualMetricsCard";
+import { API_URL } from "../lib/api";
 
-const API = "http://127.0.0.1:8000";
+const API = API_URL;
 const USER_ID = 1; // single-user demo
 
 export default function Home() {

@@ -1,6 +1,6 @@
-"node_modules/" 
-"__pycache__/" 
-".env" 
-"venv/" 
+node_modules/
+__pycache__/
+.env
+venv/
 backend/.env
 backend/biotwin.db

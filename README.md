@@ -90,8 +90,9 @@ cd frontend
 npm install
 npm run dev
 ```
-Add to `frontend/.env.local`:
+Add to `frontend/.env.local` (see `frontend/.env.local.example`):
 ```
+NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
 GOOGLE_CLIENT_ID=...
 GOOGLE_CLIENT_SECRET=...
 NEXTAUTH_SECRET=any-long-random-string
@@ -110,12 +111,17 @@ docker build -t biotwin-backend .
 docker run -p 8000:8000 --env-file .env biotwin-backend
 ```
 
-## ☁️ Deployment notes
+## ☁️ Deployment
 
-- **Backend** → Render / Railway / Fly.io (use the included Dockerfile).
-- **Frontend** → Vercel (`vercel --prod` from `/frontend`).
-- **Database** → swap SQLite for Postgres on Supabase or Neon by changing
-  `sqlite_url` in `backend/database.py` to your `DATABASE_URL`.
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for a full step-by-step Render + Vercel guide.
+In short:
+
+- **Backend** → Render (Docker, uses the included `backend/Dockerfile`, binds `$PORT`).
+- **Frontend** → Vercel (set `NEXT_PUBLIC_API_URL` to your Render URL).
+- **Database** → set `DATABASE_URL` to a Postgres connection string (Supabase/Neon)
+  to persist data; otherwise it defaults to local SQLite.
+- All localhost URLs are now configurable via env vars
+  (`NEXT_PUBLIC_API_URL`, `ALLOWED_ORIGINS`, `BACKEND_URL`, `FRONTEND_URL`).
 
 ---
 
@@ -147,7 +153,7 @@ docker run -p 8000:8000 --env-file .env biotwin-backend
 - [x] Phase 4: USDA truth engine + AI coach
 - [x] Phase 5: Streak gamification + linear regression weight prediction + Recharts visual
 - [x] Phase 6: Mobile-responsive polish, edge-case handling (non-food images, USDA misses, offline backend)
-- [ ] Phase 7: Postgres + Vercel/Render deploy (config included; run yourself)
+- [x] Phase 7: Production deploy — env-var config, Render + Vercel (see DEPLOYMENT.md)
 
 ---
 

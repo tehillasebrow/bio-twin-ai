@@ -1,25 +1,24 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { API_URL } from "../lib/api";
 
-export default function CoachCard({ userId, refreshKey }) {
+export default function CoachCard({ userId }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(false);
 
+  // NOTE: intentionally NOT auto-loaded. Each call hits Gemini, and the free
+  // tier allows only ~20 requests/day, so the coach runs only on button click.
   const load = async () => {
     setLoading(true);
     try {
       const r = await fetch(`${API_URL}/api/coach/${userId}`);
       if (r.ok) setData(await r.json());
+      else setData({ insight: "Coach unreachable." });
     } catch (_) {
       setData({ insight: "Coach unreachable." });
     }
     setLoading(false);
   };
-
-  useEffect(() => {
-    load();
-  }, [userId, refreshKey]);
 
   return (
     <div className="bg-gradient-to-br from-violet-600 to-fuchsia-600 text-white p-6 sm:p-8 rounded-3xl shadow-xl">
@@ -32,11 +31,12 @@ export default function CoachCard({ userId, refreshKey }) {
           disabled={loading}
           className="text-xs bg-white/20 hover:bg-white/30 px-3 py-1 rounded-full"
         >
-          {loading ? "Thinking..." : "Refresh"}
+          {loading ? "Thinking..." : data ? "Refresh" : "Generate"}
         </button>
       </div>
       <p className="text-sm sm:text-base leading-relaxed opacity-95">
-        {data?.insight || "Generating today's insight..."}
+        {data?.insight ||
+          "Tap Generate for a personalized insight from your last 7 days."}
       </p>
       {data?.action && (
         <div className="mt-4 bg-black/20 p-3 sm:p-4 rounded-2xl">

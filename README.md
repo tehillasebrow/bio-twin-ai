@@ -1,13 +1,16 @@
 # 🧬 Bio-Twin AI: Real-Time Health Architecture
 
 **Bio-Twin AI** is a full-stack health and fitness "digital twin" that combines
-**Gemini multimodal AI**, the **USDA FoodData Central** truth engine, **Fitbit**
-wearable sync, and **30-day weight prediction** to turn a single photo or sentence
-into a living model of your body.
+**Gemini multimodal AI**, the **USDA FoodData Central** truth engine, **Google
+Health API** wearable sync, and **30-day weight prediction** to turn a single
+photo or sentence into a living model of your body.
 
 A Next.js frontend talks to a FastAPI / SQLModel backend that runs the AI
 pipeline, fact-checks against government nutrition data, and projects your future
 weight using linear regression on calorie balance.
+
+🔗 **Live demo:** https://bio-twin-ai-rho.vercel.app
+⚙️ **API:** https://fitness-ai-b15v.onrender.com
 
 ---
 
@@ -22,9 +25,10 @@ Every AI estimate is cross-checked against the **USDA FoodData Central** API.
 If the AI's guess is >20% off, the meal is flagged with a `⚠️ AI estimate`
 badge so you know not to trust it.
 
-### ⌚ Wearable Sync (Fitbit OAuth2)
-Connect your Fitbit once and a single click pulls today's steps, active minutes,
-sleep, and resting heart rate. Access tokens auto-refresh on 401.
+### ⌚ Wearable Sync (Google Health API)
+Connect your Google account once and a single click pulls today's steps, active
+minutes, sleep, and resting heart rate from the **Google Health API** (the
+successor to the retired Fitbit Web API). Access tokens auto-refresh on 401.
 
 ### 🔥 Streak Gamification
 Hit your daily logging goal and your `🔥 streak` counter climbs. Miss a day and
@@ -54,9 +58,10 @@ SQLModel.
 | **Backend** | Python, FastAPI, SQLModel |
 | **AI** | Google Gemini 2.5 Flash (text + vision) |
 | **Nutrition Data** | USDA FoodData Central API |
-| **Wearables** | Fitbit OAuth2 (activity + sleep + HR) |
+| **Wearables** | Google Health API (activity + sleep + heart rate) |
 | **Auth** | NextAuth.js (Google) |
-| **DB** | SQLite (dev) / PostgreSQL-ready (prod) |
+| **DB** | SQLite (dev) / PostgreSQL via Supabase (prod) |
+| **Deploy** | Render (backend, Docker) + Vercel (frontend) |
 
 ---
 
@@ -64,7 +69,7 @@ SQLModel.
 
 ### 1. Clone
 ```bash
-git clone https://github.com/your-username/bio-twin-ai.git
+git clone https://github.com/tehillasebrow/bio-twin-ai.git
 cd bio-twin-ai
 ```
 
@@ -81,8 +86,13 @@ uvicorn main:app --reload
 
 Required env vars (see `.env.example`):
 - `GEMINI_API_KEY` — https://aistudio.google.com/apikey
-- `USDA_API_KEY` — https://fdc.nal.usda.gov/api-key-signup
-- `FITBIT_CLIENT_ID` / `FITBIT_CLIENT_SECRET` — https://dev.fitbit.com
+- `USDA_API_KEY` — https://fdc.nal.usda.gov/api-key-signup *(optional; falls back to `DEMO_KEY`)*
+- `GOOGLE_HEALTH_CLIENT_ID` / `GOOGLE_HEALTH_CLIENT_SECRET` — a Google Cloud
+  OAuth client with the **Google Health API** enabled
+  (https://console.cloud.google.com → APIs & Services → Credentials). You can
+  reuse the same OAuth client as Google sign-in.
+- `DATABASE_URL` *(optional)* — a Postgres connection string for persistence;
+  omit to use a local SQLite file.
 
 ### 3. Frontend
 ```bash
@@ -103,6 +113,30 @@ Open `http://localhost:3000`.
 
 ---
 
+## ⌚ Google Health API setup (wearable sync)
+
+The old Fitbit Web API was retired and folded into the **Google Health API**.
+To enable the "Connect" button:
+
+1. In **Google Cloud Console**, enable the **Google Health API** (APIs & Services
+   → Library).
+2. On the **Data Access** page, add these read-only scopes:
+   - `…/auth/googlehealth.activity_and_fitness.readonly` (steps, active minutes)
+   - `…/auth/googlehealth.sleep.readonly` (sleep)
+   - `…/auth/googlehealth.health_metrics_and_measurements.readonly` (resting HR)
+3. Keep the app in **Testing** mode and add your Google account under
+   **Test users** (restricted scopes need this; production requires a security
+   review). Note: in Testing mode, refresh tokens expire after 7 days, so you'll
+   re-click "Connect" roughly weekly.
+4. Under **Credentials → your OAuth client → Authorized redirect URIs**, add the
+   backend callback: `https://<your-backend>.onrender.com/auth/fitbit/callback`.
+5. Set `GOOGLE_HEALTH_CLIENT_ID` / `GOOGLE_HEALTH_CLIENT_SECRET` on the backend.
+
+> Sync only returns numbers if your Google account actually contains health data
+> (from a Fitbit / Pixel Watch / Wear OS device syncing into Google Health).
+
+---
+
 ## 🐳 Docker (backend)
 
 ```bash
@@ -113,14 +147,17 @@ docker run -p 8000:8000 --env-file .env biotwin-backend
 
 ## ☁️ Deployment
 
-See **[DEPLOYMENT.md](DEPLOYMENT.md)** for a full step-by-step Render + Vercel guide.
-In short:
+See **[DEPLOYMENT.md](DEPLOYMENT.md)** for the full step-by-step Render + Vercel
+guide. In short:
 
 - **Backend** → Render (Docker, uses the included `backend/Dockerfile`, binds `$PORT`).
 - **Frontend** → Vercel (set `NEXT_PUBLIC_API_URL` to your Render URL).
-- **Database** → set `DATABASE_URL` to a Postgres connection string (Supabase/Neon)
-  to persist data; otherwise it defaults to local SQLite.
-- All localhost URLs are now configurable via env vars
+- **Database** → **Supabase Postgres**. Set `DATABASE_URL` to the Supabase
+  **Session pooler** connection string (IPv4-compatible — the *direct* connection
+  is IPv6-only and won't connect from Render). The backend normalizes the
+  `postgres://` scheme to `postgresql://` automatically and creates tables on
+  startup.
+- All localhost URLs are configurable via env vars
   (`NEXT_PUBLIC_API_URL`, `ALLOWED_ORIGINS`, `BACKEND_URL`, `FRONTEND_URL`).
 
 ---
@@ -139,9 +176,9 @@ In short:
 | `GET`  | `/api/streak/{user_id}` | Current logging streak |
 | `GET`  | `/api/coach/{user_id}` | Gemini-generated 7-day insight |
 | `GET`  | `/api/prediction/{user_id}` | 30-day weight projection |
-| `GET`  | `/api/metrics/{user_id}` | Fitbit daily metrics |
-| `GET`  | `/auth/fitbit/login` | Begin Fitbit OAuth |
-| `POST` | `/api/sync-fitbit/{user_id}` | Pull today's Fitbit data |
+| `GET`  | `/api/metrics/{user_id}` | Daily wearable metrics |
+| `GET`  | `/auth/fitbit/login` | Begin Google Health OAuth *(legacy path name)* |
+| `POST` | `/api/sync-fitbit/{user_id}` | Pull today's Google Health data |
 
 ---
 
@@ -149,11 +186,12 @@ In short:
 
 - [x] Phase 1: CRUD core (meals, workouts, dashboard)
 - [x] Phase 2: AI text logging + Google auth
-- [x] Phase 3: Fitbit OAuth + AI Food Lens (vision)
+- [x] Phase 3: Wearable OAuth + AI Food Lens (vision)
 - [x] Phase 4: USDA truth engine + AI coach
 - [x] Phase 5: Streak gamification + linear regression weight prediction + Recharts visual
 - [x] Phase 6: Mobile-responsive polish, edge-case handling (non-food images, USDA misses, offline backend)
 - [x] Phase 7: Production deploy — env-var config, Render + Vercel (see DEPLOYMENT.md)
+- [x] Phase 8: Migrated wearable sync from the retired Fitbit Web API to the **Google Health API**; persistent **Supabase Postgres**
 
 ---
 

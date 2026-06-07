@@ -67,9 +67,14 @@ class WeightLog(SQLModel, table=True):
     date_logged: str = Field(default_factory=_today)
 
 
-# Use DATABASE_URL if provided (e.g. Postgres on Supabase/Neon in prod),
+# Use DATABASE_URL if provided (e.g. Postgres on Render/Supabase/Neon in prod),
 # otherwise fall back to a local SQLite file for development.
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///biotwin.db")
+
+# Render (and Heroku) hand out URLs starting with "postgres://", but SQLAlchemy
+# 2.x only accepts the "postgresql://" scheme. Normalize so either form works.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # SQLite needs check_same_thread=False to work with FastAPI's threadpool.
 connect_args = (

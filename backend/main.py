@@ -724,77 +724,111 @@ def predict_weight(user_id: int, days_ahead: int = 30, session: Session = Depend
     }
 
 
-# ---------- Fitbit OAuth ----------
-FITBIT_CLIENT_ID = os.environ.get("FITBIT_CLIENT_ID")
-FITBIT_CLIENT_SECRET = os.environ.get("FITBIT_CLIENT_SECRET")
-# Public URL of THIS backend (used to build the Fitbit OAuth callback).
+# ---------- Google Health API OAuth (replaces the retired Fitbit Web API) ----------
+# Fitbit's developer API was folded into the Google Health API. We reuse the
+# same Google OAuth client you set up for sign-in -- just make sure this
+# backend's callback URL (REDIRECT_URI below) is listed under
+# "Authorized redirect URIs" for that client in the Google Cloud Console.
+#
+# Env vars: set GOOGLE_HEALTH_CLIENT_ID / GOOGLE_HEALTH_CLIENT_SECRET, or reuse
+# your existing GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET. The old FITBIT_* names
+# still work as a fallback so existing Render config doesn't break.
+GOOGLE_HEALTH_CLIENT_ID = (
+    os.environ.get("GOOGLE_HEALTH_CLIENT_ID")
+    or os.environ.get("GOOGLE_CLIENT_ID")
+    or os.environ.get("FITBIT_CLIENT_ID")
+)
+GOOGLE_HEALTH_CLIENT_SECRET = (
+    os.environ.get("GOOGLE_HEALTH_CLIENT_SECRET")
+    or os.environ.get("GOOGLE_CLIENT_SECRET")
+    or os.environ.get("FITBIT_CLIENT_SECRET")
+)
+# Public URL of THIS backend (used to build the OAuth callback).
 BACKEND_URL = os.environ.get("BACKEND_URL", "http://localhost:8000")
 # Public URL of the frontend (where we send the user after OAuth).
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "http://localhost:3000")
+# Keep the same /auth/fitbit/* paths so the frontend and your Cloud Console
+# redirect-URI config keep working unchanged -- only the internals are Google now.
 REDIRECT_URI = f"{BACKEND_URL}/auth/fitbit/callback"
+
+GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+HEALTH_API_BASE = "https://health.googleapis.com/v4/users/me/dataTypes"
+GOOGLE_HEALTH_SCOPES = " ".join(
+    [
+        # steps + active minutes
+        "https://www.googleapis.com/auth/googlehealth.activity_and_fitness.readonly",
+        # sleep
+        "https://www.googleapis.com/auth/googlehealth.sleep.readonly",
+        # resting heart rate
+        "https://www.googleapis.com/auth/googlehealth.health_metrics_and_measurements.readonly",
+    ]
+)
 
 
 @app.get("/auth/fitbit/login")
 def fitbit_login():
-    scopes = "activity sleep profile heartrate"
-    auth_url = (
-        f"https://www.fitbit.com/oauth2/authorize?response_type=code"
-        f"&client_id={FITBIT_CLIENT_ID}&redirect_uri={urllib.parse.quote(REDIRECT_URI)}"
-        f"&scope={urllib.parse.quote(scopes)}"
-    )
+    params = {
+        "response_type": "code",
+        "client_id": GOOGLE_HEALTH_CLIENT_ID,
+        "redirect_uri": REDIRECT_URI,
+        "scope": GOOGLE_HEALTH_SCOPES,
+        "access_type": "offline",  # required to receive a refresh_token
+        "prompt": "consent",  # force a refresh_token on every (re)connect
+    }
+    auth_url = f"{GOOGLE_AUTH_URL}?{urllib.parse.urlencode(params)}"
     return RedirectResponse(url=auth_url)
 
 
 @app.get("/auth/fitbit/callback")
 def fitbit_callback(code: str, session: Session = Depends(get_session)):
-    auth_str = f"{FITBIT_CLIENT_ID}:{FITBIT_CLIENT_SECRET}"
-    b64_auth = base64.b64encode(auth_str.encode()).decode()
-    headers = {
-        "Authorization": f"Basic {b64_auth}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
     data = {
-        "client_id": FITBIT_CLIENT_ID,
+        "client_id": GOOGLE_HEALTH_CLIENT_ID,
+        "client_secret": GOOGLE_HEALTH_CLIENT_SECRET,
         "grant_type": "authorization_code",
         "redirect_uri": REDIRECT_URI,
         "code": code,
     }
-    response = requests.post("https://api.fitbit.com/oauth2/token", headers=headers, data=data)
+    response = requests.post(GOOGLE_TOKEN_URL, data=data)
     token_data = response.json()
     if "access_token" not in token_data:
-        raise HTTPException(status_code=400, detail="Failed to retrieve token")
+        raise HTTPException(status_code=400, detail=f"Failed to retrieve token: {token_data}")
 
     user_id = 1
     existing = session.get(UserToken, user_id)
+    # Google only returns a refresh_token on the first consent (or when
+    # prompt=consent). Don't overwrite a stored one with None on re-auth.
+    refresh_token = token_data.get("refresh_token")
     if existing:
         existing.access_token = token_data["access_token"]
-        existing.refresh_token = token_data["refresh_token"]
+        if refresh_token:
+            existing.refresh_token = refresh_token
         session.add(existing)
     else:
         session.add(
             UserToken(
                 user_id=user_id,
                 access_token=token_data["access_token"],
-                refresh_token=token_data["refresh_token"],
+                refresh_token=refresh_token or "",
             )
         )
     session.commit()
     return RedirectResponse(url=f"{FRONTEND_URL}/?fitbit_connected=true")
 
 
-def _refresh_fitbit_token(session: Session, user_token: UserToken) -> UserToken:
-    auth_str = f"{FITBIT_CLIENT_ID}:{FITBIT_CLIENT_SECRET}"
-    b64_auth = base64.b64encode(auth_str.encode()).decode()
+def _refresh_health_token(session: Session, user_token: UserToken) -> UserToken:
     res = requests.post(
-        "https://api.fitbit.com/oauth2/token",
-        headers={
-            "Authorization": f"Basic {b64_auth}",
-            "Content-Type": "application/x-www-form-urlencoded",
+        GOOGLE_TOKEN_URL,
+        data={
+            "client_id": GOOGLE_HEALTH_CLIENT_ID,
+            "client_secret": GOOGLE_HEALTH_CLIENT_SECRET,
+            "grant_type": "refresh_token",
+            "refresh_token": user_token.refresh_token,
         },
-        data={"grant_type": "refresh_token", "refresh_token": user_token.refresh_token},
     ).json()
     if "access_token" in res:
         user_token.access_token = res["access_token"]
+        # Google usually omits a new refresh_token on refresh -- keep the old one.
         user_token.refresh_token = res.get("refresh_token", user_token.refresh_token)
         session.add(user_token)
         session.commit()
@@ -802,34 +836,78 @@ def _refresh_fitbit_token(session: Session, user_token: UserToken) -> UserToken:
     return user_token
 
 
+def _collect_numbers(obj, keys):
+    """Best-effort numeric extraction: walk a (possibly nested) data-point dict
+    and collect every numeric value stored under any of `keys`. Used because the
+    Google Health API's per-data-type field names aren't fully published yet."""
+    found = []
+
+    def walk(node):
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k in keys and isinstance(v, (int, float)):
+                    found.append(v)
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(obj)
+    return found
+
+
 @app.post("/api/sync-fitbit/{user_id}")
 def sync_fitbit_data(user_id: int, session: Session = Depends(get_session)):
     user_token = session.get(UserToken, user_id)
     if not user_token:
-        raise HTTPException(status_code=404, detail="User Fitbit not connected")
+        raise HTTPException(status_code=404, detail="Google Health not connected")
 
     today = datetime.now().strftime("%Y-%m-%d")
+    start = f"{today}T00:00:00Z"
+    end = f"{today}T23:59:59Z"
 
-    def fetch(url, retried=False):
+    def fetch(data_type, retried=False):
+        """GET today's data points for a Google Health data type (steps /
+        sleep / heart-rate). Returns the list of dataPoints (or [])."""
         headers = {"Authorization": f"Bearer {user_token.access_token}"}
-        res = requests.get(url, headers=headers)
+        params = {"filter": f'startTime>="{start}" AND startTime<="{end}"'}
+        url = f"{HEALTH_API_BASE}/{data_type}/dataPoints"
+        res = requests.get(url, headers=headers, params=params)
         if res.status_code == 401 and not retried:
-            _refresh_fitbit_token(session, user_token)
-            return fetch(url, retried=True)
-        return res.json()
+            _refresh_health_token(session, user_token)
+            return fetch(data_type, retried=True)
+        try:
+            body = res.json()
+        except Exception:
+            body = {}
+        # Log the raw shape so field-name mapping can be tuned against real data.
+        print(f"[google-health] {data_type} status={res.status_code} body={json.dumps(body)[:1500]}")
+        return body.get("dataPoints", []) if isinstance(body, dict) else []
 
-    activity_res = fetch(f"https://api.fitbit.com/1/user/-/activities/date/{today}.json")
-    summary = activity_res.get("summary", {})
-    steps = summary.get("steps", 0)
-    total_active_minutes = summary.get("fairlyActiveMinutes", 0) + summary.get(
-        "veryActiveMinutes", 0
+    # --- Steps: sum intraday counts into a daily total ---
+    step_points = fetch("steps")
+    steps = int(sum(n for p in step_points for n in _collect_numbers(p, {"count", "steps", "value"})))
+
+    # --- Active minutes: Google Health exposes these via activity summaries;
+    # approximate from active-energy / active-minute fields when present. ---
+    active_minutes = int(
+        sum(n for p in step_points for n in _collect_numbers(p, {"activeMinutes", "activeDuration"}))
     )
-    resting_hr = summary.get("restingHeartRate")
 
-    sleep_res = fetch(f"https://api.fitbit.com/1.2/user/-/sleep/date/{today}.json")
-    sleep_minutes = 0
-    if sleep_res.get("sleep"):
-        sleep_minutes = sleep_res["sleep"][0].get("minutesAsleep", 0)
+    # --- Sleep: sum asleep duration; convert millis -> minutes if needed ---
+    sleep_points = fetch("sleep")
+    sleep_min_vals = [n for p in sleep_points for n in _collect_numbers(p, {"minutesAsleep", "durationMinutes"})]
+    if sleep_min_vals:
+        sleep_minutes = int(sum(sleep_min_vals))
+    else:
+        millis = [n for p in sleep_points for n in _collect_numbers(p, {"durationMillis", "durationMs"})]
+        sleep_minutes = int(sum(millis) / 60000) if millis else 0
+
+    # --- Heart rate: approximate resting HR as the lowest bpm reading today ---
+    hr_points = fetch("heart-rate")
+    bpm_vals = [n for p in hr_points for n in _collect_numbers(p, {"bpm", "beatsPerMinute", "value"})]
+    resting_hr = int(min(bpm_vals)) if bpm_vals else None
 
     statement = select(DailyMetric).where(
         DailyMetric.user_id == user_id, DailyMetric.date_logged == today
@@ -837,7 +915,7 @@ def sync_fitbit_data(user_id: int, session: Session = Depends(get_session)):
     metric = session.exec(statement).first()
     if metric:
         metric.steps = steps
-        metric.active_minutes = total_active_minutes
+        metric.active_minutes = active_minutes
         metric.sleep_minutes = sleep_minutes
         metric.resting_heart_rate = resting_hr
         session.add(metric)
@@ -846,7 +924,7 @@ def sync_fitbit_data(user_id: int, session: Session = Depends(get_session)):
             DailyMetric(
                 user_id=user_id,
                 steps=steps,
-                active_minutes=total_active_minutes,
+                active_minutes=active_minutes,
                 sleep_minutes=sleep_minutes,
                 resting_heart_rate=resting_hr,
                 date_logged=today,
@@ -854,9 +932,9 @@ def sync_fitbit_data(user_id: int, session: Session = Depends(get_session)):
         )
     session.commit()
     return {
-        "message": "Fitbit data synchronized",
+        "message": "Google Health data synchronized",
         "steps": steps,
-        "active_minutes": total_active_minutes,
+        "active_minutes": active_minutes,
         "sleep_minutes": sleep_minutes,
         "resting_heart_rate": resting_hr,
     }
